@@ -1,0 +1,89 @@
+name: Release
+
+# 仅 tag 触发:v* tag → 构建 linux-x64 SEA 二进制 → CI 自动发布 Release。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build linux-x64 SEA binary
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # packageManager 字段固定 pnpm@10.33.2,action-setup 自动按它装
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # build-sea.mjs 要求 dist/zcode.cjs 先存在(它不负责 bundle),
+      # build:sea:prepare 构建 CLI 的全部依赖包但排除 @zcode/cli 本体,
+      # 所以这里再单独跑 @zcode/cli 的 build 产出 dist/zcode.cjs。
+      - name: Build CLI dependencies
+        run: pnpm build:sea:prepare
+
+      - name: Build CLI bundle
+        run: pnpm --filter @zcode/cli build
+
+      - name: Build SEA binary (linux-x64)
+        run: node apps/zcode-cli/packages/cli/scripts/build-sea.mjs --target linux-x64
+
+      # 启动冒烟测试:真实拉起二进制,launch 失败或输出 GLIBC_*/CXXABI_* 报错都直接 fail,
+      # 不让跑不起来的产物进 Release。
+      - name: Smoke test binary (launch + GLIBC/CXXABI guard)
+        run: |
+          BIN=apps/zcode-cli/packages/cli/dist/zcode-linux-x64
+          chmod +x "$BIN"
+          export ZCODE_STORAGE_DIR="$(mktemp -d)"
+          if ! OUT=$("$BIN" --version 2>&1); then
+            echo "::error::binary failed to launch (possible GLIBC_*/CXXABI_* mismatch)"
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
+          printf '%s\n' "$OUT"
+          if printf '%s\n' "$OUT" | grep -qE 'GLIBC_[0-9.]+|CXXABI_[0-9.]+'; then
+            echo "::error::version output reports GLIBC_*/CXXABI_* error"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-linux-x64
+          path: apps/zcode-cli/packages/cli/dist/zcode-linux-x64
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zcode-linux-x64
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "ZCode CLI ${GITHUB_REF_NAME}" \
+            --notes "SEA 单文件可执行(linux-x64),来源:${GITHUB_SHA}。chmod +x zcode-linux-x64 后直接运行。" \
+            zcode-linux-x64
